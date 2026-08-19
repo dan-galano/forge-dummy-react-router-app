@@ -1,4 +1,21 @@
-.react-router
-build
-node_modules
-README.md
+# Forge React Router (framework mode) .dockerignore.
+#
+# Allowlist, like the sibling templates — but the allowed set is different in
+# kind. The SPA image needs one directory (the pre-built static bundle at
+# ./dist); this image needs BOTH halves of the React Router build output
+# (build/client + build/server) plus the manifest + lockfile pair the deps
+# stage installs production dependencies from.
+#
+# build/ is therefore explicitly ADMITTED — copying the spa-react-vite
+# allowlist verbatim would exclude the server bundle and produce an image
+# whose CMD has nothing to run.
+#
+# Everything else is excluded so the context transfer stays small and
+# unrelated edits do not bust the buildx cache: app/ and public/ are inputs
+# to `react-router build` and are already folded into build/, node_modules is
+# rebuilt production-only inside the image, and .git/.github/.env* must never
+# enter a published image.
+*
+!build/
+!package.json
+!package-lock.json
