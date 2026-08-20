@@ -1,12 +1,11 @@
-import type { RowDataPacket } from "mysql2";
 import { Form } from "react-router";
 import type { Route } from "./+types/home";
-import { db } from "../db.server";
+import { pool, ensureReady } from "../db.server";
 
-interface Task extends RowDataPacket {
+interface Task {
   id: number;
   title: string;
-  completed: number; // MySQL returns BOOLEAN (TINYINT) as 0/1
+  completed: boolean;
 }
 
 export function meta({}: Route.MetaArgs) {
@@ -14,29 +13,36 @@ export function meta({}: Route.MetaArgs) {
 }
 
 export async function loader() {
-  const [tasks] = await db.query<Task[]>("SELECT * FROM tasks ORDER BY id");
-  return { tasks };
+  await ensureReady();
+  const { rows } = await pool.query<Task>(
+    "SELECT * FROM tasks ORDER BY id"
+  );
+  return { tasks: rows };
 }
 
 export async function action({ request }: Route.ActionArgs) {
+  await ensureReady();
   const formData = await request.formData();
   const intent = formData.get("intent");
 
   if (intent === "add") {
     const title = String(formData.get("title") ?? "").trim();
     if (title) {
-      await db.query("INSERT INTO tasks (title) VALUES (?)", [title]);
+      await pool.query("INSERT INTO tasks (title) VALUES ($1)", [title]);
     }
   }
 
   if (intent === "toggle") {
-    await db.query("UPDATE tasks SET completed = NOT completed WHERE id = ?", [
-      formData.get("id"),
-    ]);
+    await pool.query(
+      "UPDATE tasks SET completed = NOT completed WHERE id = $1",
+      [formData.get("id")]
+    );
   }
 
   if (intent === "delete") {
-    await db.query("DELETE FROM tasks WHERE id = ?", [formData.get("id")]);
+    await pool.query("DELETE FROM tasks WHERE id = $1", [
+      formData.get("id"),
+    ]);
   }
 
   return null;
