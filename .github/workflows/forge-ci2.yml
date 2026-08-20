@@ -1,0 +1,40 @@
+name: forge-ci2
+
+# Forge CI-2 — the second-CI lane RFC-0088 (D-62) injects alongside
+# forge-stage.yml + forge-deploy.yml. Fires ONLY on workflow_dispatch, kicked
+# off by Dispatch's orchestrator after a successful staging deploy. Its
+# success is the precondition for gate-2 approval on a two-CI release policy.
+#
+# Body: noop stub for RFC-0088 Phase 5. DAST-smoke + UAT flavours land in
+# follow-up RFCs; this file exists today so the injection manifest is
+# complete, the customer repo carries every workflow the two-CI lane needs,
+# and the webhook correlation path (services/dispatch/webhook_http.go's
+# forge-ci2.yml branch) has a real run id to correlate against in
+# integration.
+#
+# Emits a success job on every dispatch so the webhook lane transitions
+# ci2_running → ci2_passed → awaiting_approval_2. Failure semantics are
+# reached by adding a `false` step in a bodied version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Forge releases.id (UUIDv7) — audit correlation between the GHA run and the Forge control-plane row."
+        required: true
+        type: string
+
+concurrency:
+  group: forge-ci2-${{ github.repository }}-${{ inputs.release_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  noop:
+    name: CI-2 noop (RFC-0088 Phase 5 stub)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Announce
+        run: echo "forge-ci2 noop — DAST-smoke / UAT bodies land in follow-up RFCs. release_id=${{ inputs.release_id }}"
