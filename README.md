@@ -1,87 +1,100 @@
-# Welcome to React Router!
+# To-Do List — React Router (framework mode) + MySQL
 
-A modern, production-ready template for building full-stack React applications using React Router.
+A minimal to-do list app. One route, one MySQL table, no ORM, no UI libraries.
 
-[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/remix-run/react-router-templates/tree/main/default)
+- **Loader** fetches all tasks from MySQL.
+- **Action** handles three `<Form>` submissions: add, toggle completed, delete.
+- `mysql2` connection pool in a single server module (`app/db.server.ts`).
 
-## Features
+## Project structure
 
-- 🚀 Server-side rendering
-- ⚡️ Hot Module Replacement (HMR)
-- 📦 Asset bundling and optimization
-- 🔄 Data loading and mutations
-- 🔒 TypeScript by default
-- 🎉 TailwindCSS for styling
-- 📖 [React Router docs](https://reactrouter.com/)
+```
+app/
+  db.server.ts      # mysql2 connection pool (server-only module)
+  routes/home.tsx   # "/" route: loader + action + UI
+  app.css           # plain CSS
+database/
+  schema.sql        # creates the database and tasks table
+.env.example        # template for DB credentials
+```
 
-## Getting Started
+## Setup
 
-### Installation
+### 1. Install and start MySQL
 
-Install the dependencies:
+**macOS (Homebrew):**
 
-```bash
+```sh
+brew install mysql
+brew services start mysql
+```
+
+**Ubuntu/Debian:**
+
+```sh
+sudo apt install mysql-server
+sudo systemctl start mysql
+```
+
+**Windows:** install [MySQL Community Server](https://dev.mysql.com/downloads/mysql/) and start the MySQL service.
+
+(Optional) Set a root password:
+
+```sh
+mysql_secure_installation
+```
+
+### 2. Create the database and table
+
+From the project root:
+
+```sh
+mysql -u root -p < database/schema.sql
+```
+
+This creates a `todo_app` database with a `tasks` table:
+
+| column    | type                    |
+| --------- | ----------------------- |
+| id        | INT AUTO_INCREMENT (PK) |
+| title     | VARCHAR(255)            |
+| completed | BOOLEAN, default FALSE  |
+
+### 3. Configure credentials
+
+```sh
+cp .env.example .env
+```
+
+Edit `.env` with your MySQL credentials:
+
+```
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=your_password_here
+DB_NAME=todo_app
+```
+
+### 4. Install dependencies
+
+```sh
 npm install
 ```
 
-### Development
+### 5. Run the dev server
 
-Start the development server with HMR:
-
-```bash
+```sh
 npm run dev
 ```
 
-Your application will be available at `http://localhost:5173`.
+Open http://localhost:5173 — add, toggle, and delete tasks. Everything is
+submitted with React Router's `<Form>` component, so it works even with
+JavaScript disabled.
 
-## Building for Production
+## Production
 
-Create a production build:
-
-```bash
+```sh
 npm run build
+npm run start
 ```
-
-## Deployment
-
-### Docker Deployment
-
-To build and run using Docker:
-
-```bash
-docker build -t my-app .
-
-# Run the container
-docker run -p 3000:3000 my-app
-```
-
-The containerized application can be deployed to any platform that supports Docker, including:
-
-- AWS ECS
-- Google Cloud Run
-- Azure Container Apps
-- Digital Ocean App Platform
-- Fly.io
-- Railway
-
-### DIY Deployment
-
-If you're familiar with deploying Node applications, the built-in app server is production-ready.
-
-Make sure to deploy the output of `npm run build`
-
-```
-├── package.json
-├── package-lock.json (or pnpm-lock.yaml, or bun.lockb)
-├── build/
-│   ├── client/    # Static assets
-│   └── server/    # Server-side code
-```
-
-## Styling
-
-This template comes with [Tailwind CSS](https://tailwindcss.com/) already configured for a simple default starting experience. You can use whatever CSS framework you prefer.
-
----
-
-Built with ❤️ using React Router.
