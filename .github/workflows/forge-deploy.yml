@@ -1,0 +1,339 @@
+name: forge-deploy
+
+# Forge Deploy — provisions/updates the app's ECS Fargate service on the
+# shared apps-demo cluster (RFC-0061 Path A). Consumes the signed OCI image
+# produced by the stage step (RFC-0056 + RFC-0064) — pulled from ECR by the
+# digest recorded in the stage manifest. NO rebuild from source — preserves
+# the cosign attest chain and D-30 (build-once).
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage_workflow_run_id:
+        description: "GHA workflow_run.id of the stage that produced the OCI image to deploy"
+        required: true
+        type: string
+      version:
+        description: "Semver tag for this release (e.g. v0.1.0). Used as the ECR image tag."
+        required: true
+        type: string
+      release_id:
+        description: "Forge releases.id (UUIDv7) — audit correlation between the GHA run and the Forge control-plane row."
+        required: false
+        type: string
+      app_env_b64:
+        description: "Base64-encoded JSON array of {name,value} container environment entries, minted by the Forge Capability Provisioner (DATABASE_URL / OBJECT_STORE_*). Empty when the app declares no capabilities. INTERIM plaintext — see TD-0013."
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: forge-deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  ECS_CLUSTER: apps-demo
+  AWS_REGION: ap-southeast-1
+  VPC_ID: vpc-09efeb48b032b4a0f
+  SUBNETS: subnet-0ab71af7a401bf795,subnet-0c634607107b2906a,subnet-0d3fbebb666ee00ab
+  SECURITY_GROUPS: sg-0b683aafb044b6aaf
+  EXECUTION_ROLE_ARN: arn:aws:iam::163078623513:role/forge-demo-task-execution-role
+  TASK_ROLE_ARN: arn:aws:iam::163078623513:role/forge-demo-task-role
+  ALB_LISTENER_ARN: arn:aws:elasticloadbalancing:ap-southeast-1:163078623513:listener/app/ecs-express-gateway-alb-de1f17f6/a90ce19bce723a94/b1e28cc6fad01336
+  ECR_ACCOUNT_ID: 163078623513
+  CONTAINER_PORT: "80"
+
+jobs:
+  deploy:
+    name: Deploy to Amazon ECS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse App Name Slug
+        id: app-info
+        run: |
+          # Repository name is forge.app.<slug> -> slug is the last part.
+          REPO_NAME="${{ github.event.repository.name }}"
+          APP_NAME=$(echo "$REPO_NAME" | sed 's/forge\.app\.//')
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download manifest from stage run
+        # Consume the RFC-0064 manifest artifact from the specified stage
+        # workflow_run.id. The manifest carries artifact.digest — the
+        # sha256:... pinning the OCI image gate-build pushed to private ECR.
+        # actions/download-artifact@v4 supports cross-run download via the
+        # run-id input (same repo).
+        uses: actions/download-artifact@v4
+        with:
+          name: manifest
+          path: ./_stage
+          run-id: ${{ inputs.stage_workflow_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ env.ECR_ACCOUNT_ID }}
+
+      - name: Bootstrap ECR Repository
+        # Defensive: the repo should already exist (gate-build creates it at
+        # Stage in RFC-0064), but describe-or-create is idempotent and guards
+        # against out-of-order deploy (e.g. redeploying an older stage run
+        # after the repo was deleted).
+        run: |
+          REPO_NAME="forge.app.${{ env.APP_NAME }}"
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "Creating ECR Repository $REPO_NAME..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --region ${{ env.AWS_REGION }}
+          else
+            echo "ECR Repository $REPO_NAME already exists."
+          fi
+
+      - name: Pull image from ECR by digest and re-tag with release version
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          VERSION_TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Read the manifest-list digest recorded by gate-build (RFC-0064).
+          # Fail-closed if the manifest is stale (schema_version != 3) — the
+          # v2 tarball path never populated artifact.digest with an OCI ref,
+          # so deploying a v2 stage run under this workflow would silently
+          # tag a garbage image.
+          SCHEMA_VERSION=$(jq -r '.schema_version' ./_stage/manifest.json)
+          if [ "$SCHEMA_VERSION" != "3" ]; then
+            echo "Refusing to deploy: manifest.schema_version=$SCHEMA_VERSION (expected 3). The stage run predates RFC-0064; re-run stage." >&2
+            exit 1
+          fi
+          ARTIFACT_KIND=$(jq -r '.artifact.kind' ./_stage/manifest.json)
+          if [ "$ARTIFACT_KIND" != "oci-image" ]; then
+            echo "Refusing to deploy: manifest.artifact.kind=$ARTIFACT_KIND (expected oci-image)." >&2
+            exit 1
+          fi
+          IMAGE_DIGEST=$(jq -r '.artifact.digest' ./_stage/manifest.json)
+          ECR_REPOSITORY="forge.app.${{ env.APP_NAME }}"
+          SOURCE_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}@${IMAGE_DIGEST}"
+          VERSIONED_REF="${ECR_REGISTRY}/${ECR_REPOSITORY}:${VERSION_TAG}"
+          echo "Pulling ${SOURCE_REF}"
+          docker pull "${SOURCE_REF}"
+          # Re-tag with the release version so ECS task-def carries a
+          # human-readable tag while still pointing at the exact bytes cosign
+          # signed. The digest reference and the tagged reference resolve to
+          # the same manifest in ECR — no rebuild, D-30 preserved.
+          docker tag "${SOURCE_REF}" "${VERSIONED_REF}"
+          docker push "${VERSIONED_REF}"
+          echo "image=${VERSIONED_REF}" >> $GITHUB_OUTPUT
+
+      - name: Bootstrap CloudWatch Log Group
+        run: |
+          LOG_GROUP="/aws/ecs/${{ env.ECS_CLUSTER }}/forge-app-${{ env.APP_NAME }}"
+          if ! aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --region ${{ env.AWS_REGION }} --query "logGroups[?logGroupName=='$LOG_GROUP'].logGroupName" --output text | grep -q "$LOG_GROUP"; then
+            aws logs create-log-group --log-group-name "$LOG_GROUP" --region ${{ env.AWS_REGION }}
+            aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 7 --region ${{ env.AWS_REGION }}
+          fi
+
+      - name: Bootstrap ALB Target Group & Rule
+        id: bootstrap-routing
+        run: |
+          set -euo pipefail
+          # Target group names have a 32-char AWS limit — truncate defensively.
+          TG_NAME="tg-forge-${{ env.APP_NAME }}"
+          TG_NAME=$(echo "$TG_NAME" | cut -c1-32)
+
+          TG_ARN=$(aws elbv2 describe-target-groups --names "$TG_NAME" --region ${{ env.AWS_REGION }} --query "TargetGroups[0].TargetGroupArn" --output text 2>/dev/null || echo "not_found")
+
+          if [ "$TG_ARN" = "not_found" ] || [ -z "$TG_ARN" ]; then
+            TG_ARN=$(aws elbv2 create-target-group \
+              --name "$TG_NAME" \
+              --protocol HTTP \
+              --port ${{ env.CONTAINER_PORT }} \
+              --vpc-id "${{ env.VPC_ID }}" \
+              --target-type ip \
+              --health-check-path "/" \
+              --health-check-interval-seconds 15 \
+              --health-check-timeout-seconds 5 \
+              --healthy-threshold-count 2 \
+              --unhealthy-threshold-count 3 \
+              --region ${{ env.AWS_REGION }} \
+              --query "TargetGroups[0].TargetGroupArn" \
+              --output text)
+          fi
+          echo "TG_ARN=$TG_ARN" >> $GITHUB_ENV
+          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
+
+          HOST_HEADER="${{ env.APP_NAME }}.forgedemo.nmblr.dev"
+          RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query "Rules[?Conditions[?Field=='host-header' && contains(Values, '$HOST_HEADER')]].RuleArn" \
+            --output text 2>/dev/null || echo "")
+
+          if [ -z "$RULE_ARN" ]; then
+            EXISTING_PRIORITIES=$(aws elbv2 describe-rules \
+              --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+              --region ${{ env.AWS_REGION }} \
+              --query "Rules[*].Priority" \
+              --output text)
+            PRIORITY=10
+            while echo "$EXISTING_PRIORITIES" | grep -w "$PRIORITY" > /dev/null; do
+              PRIORITY=$((PRIORITY + 1))
+            done
+            aws elbv2 create-rule \
+              --listener-arn "${{ env.ALB_LISTENER_ARN }}" \
+              --priority $PRIORITY \
+              --conditions "Field=host-header,Values=$HOST_HEADER" \
+              --actions "Type=forward,TargetGroupArn=$TG_ARN" \
+              --region ${{ env.AWS_REGION }}
+          fi
+
+      - name: Register ECS Task Definition
+        id: register-task-def
+        env:
+          # Read through an env var, never interpolated into the script body:
+          # this value carries credentials, and `${{ }}` substitution happens
+          # before the shell sees the line.
+          APP_ENV_B64: ${{ inputs.app_env_b64 }}
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${{ steps.build-image.outputs.image }}"
+          TASK_FAMILY="forge-app-${{ env.APP_NAME }}"
+          LOG_GROUP="/aws/ecs/${{ env.ECS_CLUSTER }}/forge-app-${{ env.APP_NAME }}"
+
+          # =============================================================
+          # Capability environment — INTERIM, see TD-0013.
+          #
+          # app_env_b64 is base64(JSON [{"name","value"}]) minted by the Forge
+          # Capability Provisioner: this app's PRODUCTION DATABASE_URL and/or
+          # OBJECT_STORE_* credentials. They are injected below as PLAINTEXT
+          # containerDefinitions[].environment entries.
+          #
+          # That is a DELIBERATE INTERIM CHOICE AND NOT A CONSIDERED END STATE.
+          # A task definition is readable by anyone holding
+          # ecs:DescribeTaskDefinition, so a database password placed here is
+          # visible to a far wider audience than it should be. TD-0013 tracks
+          # moving these to SSM Parameter Store / Secrets Manager referenced
+          # through containerDefinitions[].secrets, which keeps the values out
+          # of the task definition, out of this workflow, and out of the GHA
+          # run record entirely.
+          #
+          # Do not read the presence of this block as licence to add more
+          # secrets to it.
+          #
+          # base64 is transport encoding (it survives the workflow-input →
+          # shell → JSON round-trip without quoting hazards), NOT protection.
+          # The values are masked below so they never reach the run log.
+          # =============================================================
+          APP_ENV_JSON='[]'
+          if [ -n "${APP_ENV_B64:-}" ]; then
+            APP_ENV_JSON=$(printf '%s' "$APP_ENV_B64" | base64 -d)
+            # Mask BEFORE anything can print them.
+            printf '%s' "$APP_ENV_JSON" | jq -r '.[].value' | while IFS= read -r secret_value; do
+              if [ -n "$secret_value" ]; then
+                echo "::add-mask::$secret_value"
+              fi
+            done
+            echo "Injecting capability environment: $(printf '%s' "$APP_ENV_JSON" | jq -r '[.[].name] | join(", ")')"
+          else
+            echo "No capability environment for this app (declares none)."
+          fi
+
+          # Compose the task definition with jq, not a heredoc: a credential
+          # containing a quote or a backslash would otherwise be able to break
+          # out of the surrounding JSON.
+          TASK_DEF_JSON=$(jq -n \
+            --arg family "$TASK_FAMILY" \
+            --arg image "$IMAGE_URI" \
+            --arg execRole "${{ env.EXECUTION_ROLE_ARN }}" \
+            --arg taskRole "${{ env.TASK_ROLE_ARN }}" \
+            --arg logGroup "$LOG_GROUP" \
+            --arg region "${{ env.AWS_REGION }}" \
+            --argjson port ${{ env.CONTAINER_PORT }} \
+            --argjson appEnv "$APP_ENV_JSON" \
+            '{
+              family: $family,
+              networkMode: "awsvpc",
+              requiresCompatibilities: ["FARGATE"],
+              cpu: "256",
+              memory: "512",
+              executionRoleArn: $execRole,
+              taskRoleArn: $taskRole,
+              containerDefinitions: [
+                {
+                  name: "web",
+                  image: $image,
+                  essential: true,
+                  portMappings: [ { containerPort: $port, protocol: "tcp" } ],
+                  environment: $appEnv,
+                  logConfiguration: {
+                    logDriver: "awslogs",
+                    options: {
+                      "awslogs-group": $logGroup,
+                      "awslogs-region": $region,
+                      "awslogs-stream-prefix": "ecs"
+                    }
+                  }
+                }
+              ]
+            }')
+
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$TASK_DEF_JSON" \
+            --region ${{ env.AWS_REGION }} \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "TASK_DEF_ARN=$TASK_DEF_ARN" >> $GITHUB_ENV
+          echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+
+      - name: Create or Update ECS Service
+        run: |
+          set -euo pipefail
+          SERVICE_NAME="forge-app-${{ env.APP_NAME }}"
+          TG_ARN="${{ env.TG_ARN }}"
+          TASK_DEF_ARN="${{ env.TASK_DEF_ARN }}"
+
+          if ! aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services "$SERVICE_NAME" --region ${{ env.AWS_REGION }} --query "services[?status=='ACTIVE'].serviceName" --output text | grep -q "$SERVICE_NAME"; then
+            aws ecs create-service \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service-name "$SERVICE_NAME" \
+              --task-definition "$TASK_DEF_ARN" \
+              --launch-type FARGATE \
+              --desired-count 1 \
+              --load-balancers "targetGroupArn=$TG_ARN,containerName=web,containerPort=${{ env.CONTAINER_PORT }}" \
+              --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNETS }}],securityGroups=[${{ env.SECURITY_GROUPS }}],assignPublicIp=ENABLED}" \
+              --region ${{ env.AWS_REGION }}
+          else
+            aws ecs update-service \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service "$SERVICE_NAME" \
+              --task-definition "$TASK_DEF_ARN" \
+              --network-configuration "awsvpcConfiguration={subnets=[${{ env.SUBNETS }}],securityGroups=[${{ env.SECURITY_GROUPS }}],assignPublicIp=ENABLED}" \
+              --force-new-deployment \
+              --region ${{ env.AWS_REGION }}
+          fi
+
+          aws ecs wait services-stable --cluster ${{ env.ECS_CLUSTER }} --services "$SERVICE_NAME" --region ${{ env.AWS_REGION }}
+
+      - name: Emit live URL
+        # RFC-0061 §OQ-P2 recommendation: live_url is computed deterministically
+        # from APP_NAME + demo DNS zone (forgedemo.nmblr.dev). The webhook lane
+        # (Phase 4) can read this step output for observability, but the
+        # authoritative live_url on the releases row is set at INSERT time by
+        # the orchestrator (services/publish/release.go) to avoid the extra GH
+        # API call needed to pull step outputs from workflow_run.completed.
+        id: emit-live-url
+        run: |
+          echo "live_url=https://${{ env.APP_NAME }}.forgedemo.nmblr.dev" >> $GITHUB_OUTPUT
+          echo "Deployment completed. Live at: https://${{ env.APP_NAME }}.forgedemo.nmblr.dev"
