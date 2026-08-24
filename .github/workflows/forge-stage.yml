@@ -1,0 +1,537 @@
+name: Forge Stage
+
+on:
+  push:
+    branches: [forge/main]
+  # workflow_dispatch backs RFC-0098's no-pending-edits Stage fallback for an
+  # imported App: with nothing new to push there is no push event, so Dispatch
+  # fires this workflow manually against the default branch instead. Input-less
+  # on purpose (see embed/deploy-only/forge-stage.yml for the full rationale).
+  # Scaffolded Apps gain the same manual-dispatch affordance, harmlessly.
+  workflow_dispatch:
+
+concurrency:
+  group: forge-stage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_ACCOUNT_ID: "163078623513"
+
+jobs:
+  gate-checkrun-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare workspace for the gate image
+        # TWO adaptations the react-router template needs that the SPA
+        # template does not. Both write into the workspace BEFORE the
+        # read-only /src mount below, because the gate image copies /src
+        # wholesale into its own scratch dir and runs there.
+        #
+        # 1. pnpm-lock.yaml. gate-checkrun-node:v1.0.0 runs
+        #    `pnpm install --frozen-lockfile` with `set -eu` and no
+        #    `|| true` — with no pnpm-lock.yaml it aborts with
+        #    ERR_PNPM_NO_LOCKFILE and the whole job fails before a single
+        #    check runs. Forge's sandbox templates are npm-based (they ship
+        #    package-lock.json; containers/sandbox/Dockerfile runs `npm ci`),
+        #    so the lockfile the image wants is never in the repo.
+        #    `pnpm import` derives it from package-lock.json, preserving the
+        #    resolved versions the app was actually built against. Verified
+        #    2026-07-28 by running the published :v1.0.0 image against this
+        #    template with and without the imported lockfile.
+        #
+        # 2. React Router route types. Framework mode generates
+        #    `./+types/<route>` declarations via `react-router typegen`
+        #    (the template's own `typecheck` script is
+        #    `react-router typegen && tsc`). The gate image runs bare
+        #    `tsc --noEmit`, so without typegen every route module reports
+        #    "Cannot find module './+types/...'". Those findings cannot fail
+        #    the job — gate-checkrun-node has no verdict step and always
+        #    exits 0 — but they would pollute the SARIF artifact with two
+        #    fabricated errors on every single Stage. Running typegen first
+        #    makes the SARIF honest. node_modules is deleted afterwards so
+        #    the gate image's own pnpm install is not confused by an
+        #    npm-created store.
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx react-router typegen
+          rm -rf node_modules
+          COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack pnpm@9.15.0 import
+      - name: Run gate-checkrun-node
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-checkrun-node:v1.0.0
+          # Retry docker pull to survive intermittent Public ECR anonymous-pull
+          # rate limits from shared GHA runner IPs (2026-07-16 field feedback).
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          mkdir -p sarif
+          docker run --rm \
+            -v ${{ github.workspace }}:/src:ro \
+            -v ${{ github.workspace }}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${{ github.sha }} \
+            -e SCAN_REF=${{ github.ref }} \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-checkrun-node
+          path: sarif/findings.sarif
+          retention-days: 90
+
+  # Scan gates run AFTER checkrun succeeds (`needs:`), so devs fix
+  # lint/typecheck/test fundamentals before seeing security signal.
+  # scan-deps + scan-secrets + scan-sast + gate-build fan out in parallel
+  # after checkrun. gate-scan-image + gate-sbom join gate-build (they need
+  # the pushed image). gate-attest joins all six upstream jobs — any failure
+  # fails the sign step closed (AD-0006 §4).
+  gate-scan-deps:
+    needs: [gate-checkrun-node]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gate-scan-deps
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-scan-deps:v1.0.0
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          mkdir -p sarif
+          docker run --rm \
+            -v ${{ github.workspace }}:/src:ro \
+            -v ${{ github.workspace }}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${{ github.sha }} \
+            -e SCAN_REF=${{ github.ref }} \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-scan-deps
+          path: sarif/findings.sarif
+          retention-days: 90
+
+  gate-scan-secrets:
+    needs: [gate-checkrun-node]
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 gives gitleaks the full .git history to scan
+      # (default shallow depth=1 defeats history-based secret detection).
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gate-scan-secrets
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-scan-secrets:v1.0.0
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          mkdir -p sarif
+          docker run --rm \
+            -v ${{ github.workspace }}:/src:ro \
+            -v ${{ github.workspace }}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${{ github.sha }} \
+            -e SCAN_REF=${{ github.ref }} \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-scan-secrets
+          path: sarif/findings.sarif
+          retention-days: 90
+
+  gate-scan-sast:
+    needs: [gate-checkrun-node]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run gate-scan-sast
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-scan-sast:v1.0.0
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          mkdir -p sarif
+          docker run --rm \
+            -v ${{ github.workspace }}:/src:ro \
+            -v ${{ github.workspace }}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${{ github.sha }} \
+            -e SCAN_REF=${{ github.ref }} \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-scan-sast
+          path: sarif/findings.sarif
+          retention-days: 90
+
+  gate-build:
+    needs: [gate-checkrun-node]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image_ref: ${{ steps.build-image.outputs.image_ref }}
+      image_digest: ${{ steps.build-image.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      # npm, not pnpm: Forge's react-router sandbox template ships a
+      # committed package-lock.json (containers/sandbox/Dockerfile installs
+      # it with `npm ci`), so npm is the package manager the app's dependency
+      # tree was actually resolved with. `npm run build` runs
+      # `react-router build`, which emits BOTH halves of the SSR app —
+      # build/client (browser assets, with public/ folded in) and
+      # build/server/index.js (the request handler) — into the build context
+      # the Dockerfile below copies from.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Parse App Name Slug
+        id: app-info
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          APP_NAME=$(echo "$REPO_NAME" | sed 's/forge\.app\.//')
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ env.ECR_ACCOUNT_ID }}
+      - name: Bootstrap ECR Repository
+        # Stage owns ECR repo bootstrap (RFC-0064): gate-build is the first
+        # step that pushes; deploy just pulls by digest and no longer needs
+        # to create the repo. Kept idempotent (describe-or-create).
+        run: |
+          REPO_NAME="forge.app.${{ env.APP_NAME }}"
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "Creating ECR Repository $REPO_NAME..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --region ${{ env.AWS_REGION }}
+          else
+            echo "ECR Repository $REPO_NAME already exists."
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push multi-arch image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          COMMIT_SHA="${GITHUB_SHA}"
+          IMAGE_TAG="${COMMIT_SHA}"
+          IMAGE_REPO="${ECR_REGISTRY}/forge.app.${{ env.APP_NAME }}"
+          # amd64 ONLY, deliberately. Fargate defaults to X86_64 when a task
+          # definition declares no runtimePlatform, which is what forge-deploy
+          # registers — so the arm64 half of a multi-arch build was never pulled.
+          # It was also built under QEMU emulation on x86 runners, which is
+          # 10-50x slower for an npm install + framework build and repeatedly
+          # took Stage from ~3 minutes to 30+. Building an architecture nothing
+          # deploys, at emulation cost, is the worst of both.
+          #
+          # To go arm64 later (Graviton is ~20% cheaper per vCPU-hour): set
+          # runtimePlatform.cpuArchitecture=ARM64 in forge-deploy.yml AND build
+          # on an arm64 runner — emulation would just move the cost into CI.
+          #
+          # --iidfile records the image digest (buildx >= 0.10,
+          # docker/buildx#1533). That digest is what cosign signs downstream;
+          # --push publishes the manifest under the tag.
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            --iidfile image_digest.txt \
+            .
+          DIGEST=$(cat image_digest.txt)
+          IMAGE_REF="${IMAGE_REPO}@${DIGEST}"
+          echo "${IMAGE_REF}" > image_ref.txt
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE_REF}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-bundle
+          path: |
+            image_digest.txt
+            image_ref.txt
+          retention-days: 90
+
+  gate-scan-image:
+    needs: [gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        # Only gate-scan-image + gate-sbom receive AWS creds; source-scan
+        # gates run without them (RFC-0064 §Security Considerations). Creds
+        # are needed so the containerized trivy scanner can pull the app
+        # image from private ECR by digest.
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-bundle
+      - name: Run gate-scan-image
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-scan-image:v1.0.0
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          IMAGE_REF=$(cat image_ref.txt)
+          mkdir -p sarif-results
+          docker run --rm \
+            -e SCAN_IMAGE_REF="${IMAGE_REF}" \
+            -e SCAN_COMMIT_SHA=${{ github.sha }} \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -v ${{ github.workspace }}/sarif-results:/results \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sarif-scan-image
+          path: sarif-results/findings.sarif
+          retention-days: 90
+
+  gate-sbom:
+    needs: [gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-bundle
+      - name: Run gate-sbom
+        run: |
+          set -euo pipefail
+          IMAGE=public.ecr.aws/k1a3p1j0/gate-sbom:v1.0.0
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then break; fi
+            [ "$attempt" -lt 3 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+            sleep $((attempt * 10))
+          done
+          IMAGE_REF=$(cat image_ref.txt)
+          mkdir -p sbom-results
+          docker run --rm \
+            -e SCAN_IMAGE_REF="${IMAGE_REF}" \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -v ${{ github.workspace }}/sbom-results:/results \
+            "$IMAGE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom
+          path: sbom-results/
+          retention-days: 90
+
+  gate-attest:
+    needs: [gate-scan-deps, gate-scan-secrets, gate-scan-sast, gate-scan-image, gate-sbom, gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required by cosign for keyless OIDC signing
+    outputs:
+      manifest_uploaded: ${{ steps.upload.outcome == 'success' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-bundle
+          path: ./_build
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: ./_sbom
+      - uses: actions/download-artifact@v4
+        with:
+          name: sarif-scan-image
+          path: ./_scan
+      - id: meta
+        name: Derive build metadata
+        run: |
+          set -euo pipefail
+          IMAGE_REF=$(cat ./_build/image_ref.txt)
+          IMAGE_DIGEST=$(cat ./_build/image_digest.txt)
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_REF="${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Re-derive APP_NAME here — $GITHUB_ENV from gate-build's app-info
+          # step is job-local; gate-attest is a separate job.
+          REPO_NAME="${{ github.event.repository.name }}"
+          APP_NAME=$(echo "$REPO_NAME" | sed 's/forge\.app\.//')
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+          {
+            echo "image_ref=${IMAGE_REF}"
+            echo "image_digest=${IMAGE_DIGEST}"
+            echo "build_ref=${BUILD_REF}"
+            echo "built_at=${BUILT_AT}"
+          } >> "$GITHUB_OUTPUT"
+      # cosign sign publishes the signature as an OCI referrer alongside the
+      # image manifest in ECR, which requires ECR push credentials — cosign
+      # keyless OIDC only signs, it does NOT authenticate to the destination
+      # registry. Configure AWS creds + ECR login BEFORE cosign runs so the
+      # PUT /v2/.../manifests/sha256:... calls carry a valid bearer token.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GLOBAL_DEVELOP_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.GLOBAL_DEVELOP_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: ${{ env.ECR_ACCOUNT_ID }}
+      - uses: sigstore/cosign-installer@v3
+      - id: sign
+        name: Sign image + attest SBOM + attest scan (cosign keyless OIDC)
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          # cosign sign publishes the signature as an OCI referrer alongside
+          # the image manifest in ECR (RFC-0064). Unlike sign-blob, there is
+          # no sidecar bundle file — the transparency log entry lives in the
+          # registry referrers index and is looked up via `cosign tree`.
+          cosign sign --yes "${IMAGE_REF}"
+          # SPDX SBOM attestation — cosign's --type spdxjson alias maps to
+          # the in-toto SPDX JSON predicate type. TASK-0029's OPA gate reads
+          # this attestation to enforce SBOM presence at deploy time.
+          cosign attest --yes --predicate ./_sbom/sbom.spdx.json --type spdxjson "${IMAGE_REF}"
+          # Vulnerability scan attestation — --type vuln alias maps to the
+          # in-toto vulnerability predicate type (SARIF payload).
+          cosign attest --yes --predicate ./_scan/findings.sarif --type vuln "${IMAGE_REF}"
+      - id: manifest
+        name: Emit manifest.json
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.meta.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          # SBOM digest + package_count from the sbom artifact (meta.json is
+          # written inline by gate-sbom's entrypoint — see containers/gate-sbom).
+          SBOM_DIGEST="sha256:$(sha256sum ./_sbom/sbom.spdx.json | cut -d' ' -f1)"
+          PACKAGE_COUNT=$(jq -r '.package_count // 0' ./_sbom/meta.json 2>/dev/null || echo 0)
+          # SARIF digest + severity counts. Trivy encodes severity on the
+          # matched rule (runs[].tool.driver.rules[].properties.tags contains
+          # "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"); results[] reference the rule
+          # by ruleIndex. Best-effort — zeros on parse failure; the summary
+          # block is informational (TASK-0029 re-parses SARIF authoritatively).
+          SCAN_DIGEST="sha256:$(sha256sum ./_scan/findings.sarif | cut -d' ' -f1)"
+          count_severity() {
+            local sev="$1"
+            jq -r --arg sev "$sev" '
+              [ .runs[]?
+                | . as $run
+                | .results[]?
+                | ($run.tool.driver.rules[.ruleIndex // 0].properties.tags // [])
+                | map(ascii_upcase)
+                | select(index($sev))
+              ] | length
+            ' ./_scan/findings.sarif 2>/dev/null || echo 0
+          }
+          CRITICAL=$(count_severity CRITICAL); CRITICAL=${CRITICAL:-0}
+          HIGH=$(count_severity HIGH); HIGH=${HIGH:-0}
+          MEDIUM=$(count_severity MEDIUM); MEDIUM=${MEDIUM:-0}
+          LOW=$(count_severity LOW); LOW=${LOW:-0}
+          echo "SARIF summary: critical=$CRITICAL high=$HIGH medium=$MEDIUM low=$LOW"
+          # verify_hint uses `cosign tree` because for image-sign the
+          # signature + attestations live as OCI referrers, not a sidecar
+          # bundle. `cosign tree` enumerates them for the given image ref.
+          VERIFY_HINT="cosign tree ${IMAGE_REF}"
+          # oidc_identity is the exact OIDC subject the keyless signing cert
+          # carries — the value a strict `cosign verify --certificate-identity`
+          # consumer needs. GHA sets GITHUB_WORKFLOW_REF to
+          # `{owner}/{repo}/.github/workflows/{file}.yml@{ref}` — prefixing
+          # with `https://github.com/` yields the SAN identity Fulcio issued.
+          OIDC_IDENTITY="https://github.com/${GITHUB_WORKFLOW_REF}"
+          cat > manifest.json <<EOF
+          {
+            "schema_version": 3,
+            "app_template": "ssr/react-router",
+            "commit_sha": "${GITHUB_SHA}",
+            "build_ref": "${{ steps.meta.outputs.build_ref }}",
+            "built_at": "${{ steps.meta.outputs.built_at }}",
+            "run_id": ${GITHUB_RUN_ID},
+            "run_number": ${GITHUB_RUN_NUMBER},
+            "artifact": {
+              "kind": "oci-image",
+              "name": "forge.app.${{ env.APP_NAME }}",
+              "size_bytes": 0,
+              "digest": "${IMAGE_DIGEST}"
+            },
+            "attestation": {
+              "kind": "cosign-sigstore",
+              "signature_bundle": "",
+              "rekor_log_index": "",
+              "oidc_identity": "${OIDC_IDENTITY}",
+              "verify_hint": "${VERIFY_HINT}"
+            },
+            "sbom": {
+              "format": "spdx-json",
+              "path": "sbom.spdx.json",
+              "digest": "${SBOM_DIGEST}",
+              "package_count": ${PACKAGE_COUNT}
+            },
+            "image_scan": {
+              "scanner": "trivy",
+              "format": "sarif",
+              "path": "findings.sarif",
+              "digest": "${SCAN_DIGEST}",
+              "summary": {
+                "critical": ${CRITICAL},
+                "high": ${HIGH},
+                "medium": ${MEDIUM},
+                "low": ${LOW}
+              }
+            },
+            "release": { "tag": null }
+          }
+          EOF
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: manifest.json
+          retention-days: 90
